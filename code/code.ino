@@ -1,27 +1,75 @@
 #include <Arduino.h>
 #include <math.h>
+#include <phyphoxBle.h>
 
+
+// =============================================================================
+// Konfiguration
+// =============================================================================
+
+// Name, der in der phyphox-Geräteliste erscheint.
+static constexpr char PHYPHOX_DEVICE_NAME[] =
+    "Tecpel DMM-8061 ESP32-C3";
+
+// Baudrate des Tecpel DMM-8061.
+static constexpr uint32_t DMM_BAUDRATE = 2400;
+
+// FS9721-Telegrammlänge.
 static constexpr uint8_t FRAME_LEN = 14;
+
+// Pause zwischen zwei Telegrammen.
 static constexpr unsigned long FRAME_GAP_US = 150000UL;
 
 
 // -----------------------------------------------------------------------------
-// Ergebnis einer Messung
+// DMM 1
 // -----------------------------------------------------------------------------
+
+static constexpr int DMM1_RX_PIN = 4;
+static constexpr int DMM1_TX_PIN = 5;
+
+
+// -----------------------------------------------------------------------------
+// Zweites DMM
+//
+// Beim ESP32-C3 ist normalerweise nur ein zusätzlicher Hardware-UART neben
+// USB-Serial sinnvoll nutzbar. Deshalb ist DMM2 standardmäßig deaktiviert.
+//
+// Für klassische ESP32-Boards kann USE_DMM2 auf true gesetzt werden.
+// Die Pins müssen dann an die Hardware angepasst werden.
+// -----------------------------------------------------------------------------
+
+static constexpr bool USE_DMM2 = false;
+
+#if USE_DMM2
+static constexpr int DMM2_RX_PIN = 16;
+static constexpr int DMM2_TX_PIN = 17;
+#endif
+
+
+// =============================================================================
+// Datenstrukturen
+// =============================================================================
 
 struct DmmMeasurement {
     float value = NAN;
+
+    // Einheit ohne SI-Präfix, weil value bereits in SI-Basiseinheiten
+    // umgerechnet wurde.
+    //
+    // Beispiel:
+    // DMM-Anzeige: 8 mV
+    // value:       0.008
+    // unit:        "V"
     String unit;
+
     bool valid = false;
 };
 
 
-// -----------------------------------------------------------------------------
-// Zustand eines DMM-Eingangs
-// -----------------------------------------------------------------------------
-
 struct DmmPort {
     HardwareSerial *serial;
+
     int rxPin;
     int txPin;
 
@@ -31,41 +79,66 @@ struct DmmPort {
     bool inFrame = false;
     unsigned long lastByteMicros = 0;
 
-    DmmMeasurement measurement;
+    DmmMeasurement latest;
 };
 
 
-// -----------------------------------------------------------------------------
-// DMM-Eingänge konfigurieren
-// -----------------------------------------------------------------------------
+// =============================================================================
+// Serielle DMM-Ports
+// =============================================================================
 
 DmmPort dmm1 {
     &Serial1,
-    4,       // RX
-    5        // TX, wird beim reinen Empfang normalerweise nicht benötigt
+    DMM1_RX_PIN,
+    DMM1_TX_PIN
 };
 
-#if defined(CONFIG_IDF_TARGET_ESP32) || \
-    defined(CONFIG_IDF_TARGET_ESP32S2) || \
-    defined(CONFIG_IDF_TARGET_ESP32S3)
+#if USE_DMM2
+HardwareSerial DmmSerial2(2);
 
 DmmPort dmm2 {
-    &Serial2,
-    16,      // Beispiel-Pin, an deine Hardware anpassen
-    17
+    &DmmSerial2,
+    DMM2_RX_PIN,
+    DMM2_TX_PIN
 };
-
 #endif
 
 
-// -----------------------------------------------------------------------------
-// DMM-Serialport initialisieren
-// -----------------------------------------------------------------------------
+// =============================================================================
+// phyphox-Experiment
+// =============================================================================
+//
+// Die phyphox-Library erzeugt daraus automatisch die Benutzeroberfläche.
+//
+// Kanalbelegung:
+//   CH0 = von phyphox erzeugter Zeitstempel
+//   CH1 = DMM1-Wert
+//   CH2 = DMM2-Wert, falls aktiviert
+//
+// Die Phyphox-Library verwendet für setChannel() eine nullbasierte Kanalnummer.
+// =============================================================================
+
+PhyphoxBleExperiment phyphoxExperiment;
+
+PhyphoxBleExperiment::View mainView;
+
+PhyphoxBleExperiment::Graph measurementGraph;
+
+PhyphoxBleExperiment::Value currentValueDmm1;
+
+#if USE_DMM2
+PhyphoxBleExperiment::Value currentValueDmm2;
+#endif
+
+
+// =============================================================================
+// DMM initialisieren
+// =============================================================================
 
 void initDmm(DmmPort &dmm)
 {
     dmm.serial->begin(
-        2400,
+        DMM_BAUDRATE,
         SERIAL_8N1,
         dmm.rxPin,
         dmm.txPin
@@ -74,13 +147,20 @@ void initDmm(DmmPort &dmm)
     dmm.framePos = 0;
     dmm.inFrame = false;
     dmm.lastByteMicros = 0;
-    dmm.measurement.valid = false;
+    dmm.latest.valid = false;
 }
 
 
-// -----------------------------------------------------------------------------
+// =============================================================================
 // FS9721-Ziffer dekodieren
-// -----------------------------------------------------------------------------
+// =============================================================================
+//
+// Der FS9721 überträgt jede Ziffer über zwei Bytes:
+//
+//   digit = ((byte_odd & 0x0f) << 4) | (byte_even & 0x0f)
+//
+// Das obere Nibble jedes Bytes ist ein Synchronisations-Nibble.
+// =============================================================================
 
 int parseDigit(uint8_t firstByte, uint8_t secondByte)
 {
@@ -110,19 +190,20 @@ int parseDigit(uint8_t firstByte, uint8_t secondByte)
 }
 
 
-// -----------------------------------------------------------------------------
-// FS9721-Synchronisation prüfen
+// =============================================================================
+// Synchronisationsprüfung
+// =============================================================================
 //
 // Gültige High-Nibbles:
 //
 //   1 2 3 4 5 6 7 8 9 A B C D E
-// -----------------------------------------------------------------------------
+// =============================================================================
 
 bool packetSyncIsValid(const uint8_t *frame)
 {
     for (uint8_t i = 0; i < FRAME_LEN; i++) {
-        uint8_t expected = i + 1;
-        uint8_t actual = (frame[i] >> 4) & 0x0F;
+        const uint8_t expected = i + 1;
+        const uint8_t actual = (frame[i] >> 4) & 0x0F;
 
         if (actual != expected) {
             return false;
@@ -133,29 +214,37 @@ bool packetSyncIsValid(const uint8_t *frame)
 }
 
 
-// -----------------------------------------------------------------------------
-// Einheit dekodieren
+// =============================================================================
+// Einheit und Modus dekodieren
+// =============================================================================
 //
-// Der Zahlenwert wird später bereits mit dem SI-Faktor multipliziert.
-// Deshalb wird der Präfix hier absichtlich nicht zur Ausgabe-Einheit
-// hinzugefügt.
+// Der SI-Präfix wird absichtlich nicht in unit aufgenommen.
 //
 // Beispiel:
-//   Anzeige: 8 mV
-//   Ergebnis: value = 0.008
-//   unit    = "V"
-// -----------------------------------------------------------------------------
+//
+//   Messwert: 0.008
+//   Einheit:  "V"
+//
+// statt:
+//
+//   Messwert: 8
+//   Einheit:  "mV"
+//
+// Dadurch bleibt der Zahlenwert unabhängig von der Displaydarstellung in
+// SI-Basiseinheiten.
+// =============================================================================
 
 void decodeUnit(const uint8_t *frame, String &unit)
 {
     unit = "";
 
-    uint8_t b9  = frame[9]  & 0x0F;
-    uint8_t b10 = frame[10] & 0x0F;
-    uint8_t b11 = frame[11] & 0x0F;
-    uint8_t b12 = frame[12] & 0x0F;
+    const uint8_t b0  = frame[0]  & 0x0F;
+    const uint8_t b9  = frame[9]  & 0x0F;
+    const uint8_t b10 = frame[10] & 0x0F;
+    const uint8_t b11 = frame[11] & 0x0F;
+    const uint8_t b12 = frame[12] & 0x0F;
 
-    // Basiseinheit
+    // Einheit
     if (b12 & 0x04) {
         unit = "V";
     } else if (b12 & 0x08) {
@@ -172,11 +261,11 @@ void decodeUnit(const uint8_t *frame, String &unit)
         unit = "V";
     } else if (b10 & 0x01) {
         unit = "Cont";
+    } else {
+        unit = "";
     }
 
     // AC/DC voranstellen
-    uint8_t b0 = frame[0] & 0x0F;
-
     if (b0 & 0x08) {
         unit = "AC " + unit;
     } else if (b0 & 0x04) {
@@ -185,9 +274,9 @@ void decodeUnit(const uint8_t *frame, String &unit)
 }
 
 
-// -----------------------------------------------------------------------------
-// Messwert eines FS9721-Frames dekodieren
-// -----------------------------------------------------------------------------
+// =============================================================================
+// FS9721-Frame dekodieren
+// =============================================================================
 
 bool decodeDmmFrame(
     const uint8_t *frame,
@@ -209,12 +298,15 @@ bool decodeDmmFrame(
             );
 
         digitBytes[i] &= 0x7F;
-        digits[i] = parseDigit(frame[1 + i * 2],
-                               frame[2 + i * 2]);
+
+        digits[i] = parseDigit(
+            frame[1 + i * 2],
+            frame[2 + i * 2]
+        );
     }
 
-    // Overload-Darstellung laut sigrok
-    bool overLimit =
+    // Overload-Darstellung des FS9721.
+    const bool overLimit =
         digitBytes[0] == 0x00 &&
         digitBytes[1] == 0x7D &&
         digitBytes[2] == 0x68 &&
@@ -256,7 +348,7 @@ bool decodeDmmFrame(
         value = -value;
     }
 
-    // SI-Multiplikatoren anwenden.
+    // SI-Multiplikatoren
     //
     // Byte 9:
     //   bit 3 = micro
@@ -266,20 +358,20 @@ bool decodeDmmFrame(
     // Byte 10:
     //   bit 3 = milli
     //   bit 1 = mega
-    //
-    uint8_t b9  = frame[9]  & 0x0F;
-    uint8_t b10 = frame[10] & 0x0F;
+
+    const uint8_t b9  = frame[9]  & 0x0F;
+    const uint8_t b10 = frame[10] & 0x0F;
 
     if (b9 & 0x04) {
-        value *= 1.0e-9f;       // nano
+        value *= 1.0e-9f;
     } else if (b9 & 0x08) {
-        value *= 1.0e-6f;       // micro
+        value *= 1.0e-6f;
     } else if (b10 & 0x08) {
-        value *= 1.0e-3f;       // milli
+        value *= 1.0e-3f;
     } else if (b9 & 0x02) {
-        value *= 1.0e3f;        // kilo
+        value *= 1.0e3f;
     } else if (b10 & 0x02) {
-        value *= 1.0e6f;        // mega
+        value *= 1.0e6f;
     }
 
     result.value = value;
@@ -290,19 +382,16 @@ bool decodeDmmFrame(
 }
 
 
-// -----------------------------------------------------------------------------
-// DMM lesen
+// =============================================================================
+// DMM pollen
+// =============================================================================
 //
 // Rückgabe:
-//   true  = ein vollständiger neuer Messwert wurde empfangen
-//   false = noch kein vollständiger Messwert vorhanden
+//   true  = neuer vollständiger Messwert
+//   false = noch kein neuer Messwert
 //
-// Der Wert selbst steht in:
-//   result.value
-//
-// Die Einheit steht in:
-//   result.unit
-// -----------------------------------------------------------------------------
+// Diese Funktion gibt nichts am seriellen Monitor aus.
+// =============================================================================
 
 bool pollDmm(
     DmmPort &dmm,
@@ -310,12 +399,12 @@ bool pollDmm(
 )
 {
     while (dmm.serial->available()) {
-        uint8_t b =
+        const uint8_t byte =
             static_cast<uint8_t>(dmm.serial->read());
 
-        unsigned long now = micros();
+        const unsigned long now = micros();
 
-        bool newFrame =
+        const bool newFrame =
             dmm.lastByteMicros == 0 ||
             static_cast<unsigned long>(
                 now - dmm.lastByteMicros
@@ -326,8 +415,8 @@ bool pollDmm(
         if (newFrame) {
             dmm.framePos = 0;
 
-            // Ein Frame muss mit einem Byte 0x1x beginnen.
-            dmm.inFrame = ((b >> 4) == 0x01);
+            // Ein gültiger Frame beginnt mit einem Byte 0x1x.
+            dmm.inFrame = ((byte >> 4) == 0x01);
         }
 
         if (!dmm.inFrame) {
@@ -340,17 +429,20 @@ bool pollDmm(
             continue;
         }
 
-        dmm.frame[dmm.framePos++] = b;
+        dmm.frame[dmm.framePos++] = byte;
 
         if (dmm.framePos == FRAME_LEN) {
-            bool decoded =
-                decodeDmmFrame(dmm.frame, dmm.measurement);
+            const bool decoded =
+                decodeDmmFrame(
+                    dmm.frame,
+                    dmm.latest
+                );
 
             dmm.framePos = 0;
             dmm.inFrame = false;
 
             if (decoded) {
-                result = dmm.measurement;
+                result = dmm.latest;
                 return true;
             }
         }
@@ -360,9 +452,9 @@ bool pollDmm(
 }
 
 
-// -----------------------------------------------------------------------------
-// Beispielausgabe im Hauptprogramm
-// -----------------------------------------------------------------------------
+// =============================================================================
+// Serielle Ausgabe
+// =============================================================================
 
 void printMeasurement(
     const char *name,
@@ -371,6 +463,11 @@ void printMeasurement(
 {
     Serial.print(name);
     Serial.print(": ");
+
+    if (!measurement.valid) {
+        Serial.println("ungültig");
+        return;
+    }
 
     if (isinf(measurement.value)) {
         Serial.print("O.L");
@@ -383,9 +480,200 @@ void printMeasurement(
 }
 
 
-// -----------------------------------------------------------------------------
+// =============================================================================
+// phyphox-Oberfläche erzeugen
+// =============================================================================
+
+void setupPhyphoxExperiment()
+{
+    phyphoxExperiment.setTitle(
+        "Tecpel DMM-8061 Messwerte"
+    );
+
+    phyphoxExperiment.setCategory(
+        "Multimeter"
+    );
+
+    phyphoxExperiment.setDescription(
+        "Messwerte des Tecpel DMM-8061. "
+        "Die Zahlenwerte werden in SI-Basiseinheiten übertragen."
+    );
+
+    phyphoxExperiment.setColor(
+        "F6F6F6"
+    );
+
+
+    // -------------------------------------------------------------------------
+    // Hauptansicht
+    // -------------------------------------------------------------------------
+
+    mainView.setLabel(
+        "Messung"
+    );
+
+
+    // -------------------------------------------------------------------------
+    // Graph
+    // -------------------------------------------------------------------------
+    //
+    // CH0 = phyphox-Zeitstempel
+    // CH1 = DMM1
+    // CH2 = DMM2
+    //
+    // x = 0, y = 1 bedeutet:
+    // Messwert über der von phyphox erzeugten Zeit.
+    // -------------------------------------------------------------------------
+
+    measurementGraph.setUnitX(
+        "s"
+    );
+
+    measurementGraph.setLabelX(
+        "Zeit"
+    );
+
+    measurementGraph.setLabelY(
+        "Messwert"
+    );
+
+    measurementGraph.setXPrecision(
+        4
+    );
+
+    measurementGraph.setYPrecision(
+        6
+    );
+
+    measurementGraph.setStyle(
+        STYLE_LINES
+    );
+
+    measurementGraph.setColor(
+        "32DB44"
+    );
+
+    measurementGraph.setLinewidth(
+        2.0f
+    );
+
+    // Automatische Achsenskalierung.
+    measurementGraph.setMinY(
+        0,
+        LAYOUT_AUTO
+    );
+
+    measurementGraph.setMaxY(
+        0,
+        LAYOUT_AUTO
+    );
+
+    // CH0 ist die von phyphox erzeugte Empfangszeit.
+    // CH1 ist DMM1.
+    measurementGraph.setChannel(
+        0,
+        1
+    );
+
+#if USE_DMM2
+
+    // Zweite Kurve im selben Graphen.
+    PhyphoxBleExperiment::Graph::Subgraph dmm2Subgraph;
+
+    dmm2Subgraph.setChannel(
+        0,
+        2
+    );
+
+    dmm2Subgraph.setStyle(
+        STYLE_LINES
+    );
+
+    dmm2Subgraph.setColor(
+        "E4572E"
+    );
+
+    dmm2Subgraph.setLinewidth(
+        2.0f
+    );
+
+    measurementGraph.addSubgraph(
+        dmm2Subgraph
+    );
+
+#endif
+
+    mainView.addElement(
+        measurementGraph
+    );
+
+
+    // -------------------------------------------------------------------------
+    // Aktueller Wert DMM1
+    // -------------------------------------------------------------------------
+
+    currentValueDmm1.setLabel(
+        "Aktueller Messwert DMM1"
+    );
+
+    currentValueDmm1.setPrecision(
+        6
+    );
+
+    currentValueDmm1.setColor(
+        "F6F6F6"
+    );
+
+    currentValueDmm1.setChannel(
+        1
+    );
+
+    mainView.addElement(
+        currentValueDmm1
+    );
+
+
+#if USE_DMM2
+
+    // -------------------------------------------------------------------------
+    // Aktueller Wert DMM2
+    // -------------------------------------------------------------------------
+
+    currentValueDmm2.setLabel(
+        "Aktueller Messwert DMM2"
+    );
+
+    currentValueDmm2.setPrecision(
+        6
+    );
+
+    currentValueDmm2.setColor(
+        "E4572E"
+    );
+
+    currentValueDmm2.setChannel(
+        2
+    );
+
+    mainView.addElement(
+        currentValueDmm2
+    );
+
+#endif
+
+    phyphoxExperiment.addView(
+        mainView
+    );
+
+    PhyphoxBLE::addExperiment(
+        phyphoxExperiment
+    );
+}
+
+
+// =============================================================================
 // Arduino setup
-// -----------------------------------------------------------------------------
+// =============================================================================
 
 void setup()
 {
@@ -394,37 +682,84 @@ void setup()
 
     initDmm(dmm1);
 
-#if defined(CONFIG_IDF_TARGET_ESP32) || \
-    defined(CONFIG_IDF_TARGET_ESP32S2) || \
-    defined(CONFIG_IDF_TARGET_ESP32S3)
-
+#if USE_DMM2
     initDmm(dmm2);
 #endif
 
-    Serial.println("DMM reader ready");
+    // Der Name erscheint beim Scannen in phyphox.
+    PhyphoxBLE::start(
+        PHYPHOX_DEVICE_NAME
+    );
+
+    setupPhyphoxExperiment();
+
+    Serial.println();
+    Serial.println("Tecpel DMM-8061 reader ready");
+    Serial.print("phyphox device name: ");
+    Serial.println(PHYPHOX_DEVICE_NAME);
 }
 
 
-// -----------------------------------------------------------------------------
+// =============================================================================
 // Arduino loop
-// -----------------------------------------------------------------------------
+// =============================================================================
 
 void loop()
 {
-    DmmMeasurement measurement;
+    DmmMeasurement newMeasurement;
 
-    // DMM 1 auslesen
-    if (pollDmm(dmm1, measurement)) {
-        printMeasurement("DMM1", measurement);
+
+    // -------------------------------------------------------------------------
+    // DMM1 lesen
+    // -------------------------------------------------------------------------
+
+    if (pollDmm(dmm1, newMeasurement)) {
+        printMeasurement(
+            "DMM1",
+            newMeasurement
+        );
+
+        // O.L wird nicht an phyphox gesendet, da Infinity kein sinnvoller
+        // Float-Wert für die phyphox-Anzeige ist.
+        if (newMeasurement.valid &&
+            !isinf(newMeasurement.value)) {
+
+            PhyphoxBLE::write(
+                newMeasurement.value
+            );
+        }
     }
 
-#if defined(CONFIG_IDF_TARGET_ESP32) || \
-    defined(CONFIG_IDF_TARGET_ESP32S2) || \
-    defined(CONFIG_IDF_TARGET_ESP32S3)
 
-    // DMM 2 auslesen
-    if (pollDmm(dmm2, measurement)) {
-        printMeasurement("DMM2", measurement);
+#if USE_DMM2
+
+    // -------------------------------------------------------------------------
+    // DMM2 lesen
+    // -------------------------------------------------------------------------
+
+    if (pollDmm(dmm2, newMeasurement)) {
+        printMeasurement(
+            "DMM2",
+            newMeasurement
+        );
+
+        if (newMeasurement.valid &&
+            !isinf(newMeasurement.value)) {
+
+            // Wenn zwei Werte übertragen werden, müssen beide Werte in
+            // demselben write()-Aufruf stehen.
+            //
+            // Für eine vollständig synchrone Zwei-DMM-Anwendung sollten die
+            // letzten Werte beider DMMs zwischengespeichert werden.
+        }
     }
+
 #endif
+
+    // Für den ESP32 ist poll() normalerweise nicht erforderlich.
+    // Für einige andere Boards, die von der Library unterstützt werden,
+    // ist es notwendig. Auf dem ESP32 schadet der Aufruf nicht.
+    PhyphoxBLE::poll();
+
+    delay(5);
 }
