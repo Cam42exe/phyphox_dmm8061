@@ -26,12 +26,23 @@ bool readScale() {
 
       buffer[pos] = '\0';
 
-      char* end;
-      float value = strtof(buffer, &end);
+      // Leerzeichen innerhalb des Vorzeichens und der Zahl entfernen
+      char cleaned[32];
+      size_t j = 0;
 
-      if (end == buffer) {
+      for (size_t i = 0; buffer[i] != '\0'; i++) {
+        if (buffer[i] != ' ' && buffer[i] != '\t') {
+          cleaned[j++] = buffer[i];
+        }
+      }
+      cleaned[j] = '\0';
+
+      char* end;
+      float value = strtof(cleaned, &end);
+
+      if (end == cleaned) {
         pos = 0;
-        continue;  // Keine gültige Zahl
+        continue;
       }
 
       latestWeight = value;
